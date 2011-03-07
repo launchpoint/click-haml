@@ -1,0 +1,731 @@
+<?php
+class HamlLexer {
+  var $current_block_level = 0;
+  var $tag_stack = array();
+  var $current_tag = null;
+  var $php_open = false;
+  var $new_block_level = 0;
+  var $is_new_line = true;
+  var $counter = 0;
+  var $line=0;
+  var $debug_path = null;
+  var $short_tags = array('br', 'hr', 'link', 'meta', 'img', 'input');
+  var $is_current_tag_open = false;
+  var $php_wrap=false;
+  var $is_sass_mode = false;
+  var $css_classes = array();
+
+  function render_to_string()
+  {
+    $this->data = preg_replace("/\r/", "", $this->data);
+    ob_start();
+    if ($this->debug_path) echo "\n<!-- HAML $this->debug_path -->\n";
+    do
+    {
+      $res = $this->yylex();
+    } while($res);
+    $this->finish_render();
+    if ($this->debug_path) echo "\n<!-- END HAML $this->debug_path -->\n";
+    $s = ob_get_contents();
+    ob_end_clean();
+    return $s;
+  }
+  
+  function finish_render()
+  {
+    if ($this->php_open) echo " ?>";
+    if ($this->current_tag !== null)
+    {
+      if (count($this->css_classes)>0)
+      {
+        echo ' class="' . join(' ', $this->css_classes) . '">';
+        $this->css_classes=array();
+      }
+      if ($this->current_tag && array_search($this->current_tag, $this->short_tags) !== false)
+      {
+        echo '/>';
+      } else {
+        if ($this->is_current_tag_open==true) echo ">";
+        echo "</$this->current_tag>";
+      }
+    }
+    echo "\n";
+    while($this->current_block_level>=0)
+    {
+      $this->current_block_level--;
+      $indent = str_pad("", $this->current_block_level*2);
+      if ($this->is_sass_mode)
+      {
+        $this->output_sass();
+      }
+      $tag = array_pop($this->tag_stack);
+      if ($tag == "*php_block_end*")
+      {
+        $tag = "<? } ?>";
+      }
+      echo "$indent$tag\n";
+    }
+  }
+  
+  function indent($is_php=false)
+  {
+    $indent = str_pad("", $this->new_block_level*2);
+    $current_block_level = $this->current_block_level;
+    if ($this->current_block_level>$this->new_block_level)
+    {
+      if ($this->php_open) echo " ?>";
+      $this->php_open=false;
+      if ($this->current_tag == null) echo "\n";
+    }
+    while($current_block_level>$this->new_block_level)
+    {
+      $current_block_level--;
+      $indent = str_pad("", $current_block_level*2);
+      if ($this->current_tag !== null)
+      {
+        echo "</$this->current_tag>\n";
+        $this->current_tag=null;
+      }
+      $tag = array_pop($this->tag_stack);
+      if ($tag == "*php_block_end*")
+      {
+        if ($is_php && $current_block_level == $this->new_block_level)
+        {
+          $tag = "<? } ";
+          $this->php_open=true;
+        } else {
+          $tag = "<? } ?>";
+        }
+      }
+      echo "$indent$tag\n";
+        
+    }
+    if ($this->current_block_level>$this->new_block_level)
+    {
+      echo "$indent";
+    }    
+    if ($this->new_block_level == $this->current_block_level)
+    {
+      if ($this->php_open) echo " ?>";
+      $this->php_open=false;
+      if ($this->current_tag !== null)
+      {
+        echo "</$this->current_tag>";
+        $this->current_tag=null;
+      }
+      echo "\n$indent";
+    }
+    if ($this->new_block_level > $this->current_block_level)
+    {
+      if ($this->php_open)
+      {
+        echo " { ?>";
+        $this->tag_stack[] = "*php_block_end*";
+        $this->php_open=false;
+      } else {
+        $this->tag_stack[] = "</$this->current_tag>"; // fixme??
+      }
+      echo "\n$indent";
+      $this->current_tag=null;
+    }
+
+    $this->current_block_level=$this->new_block_level;
+  }
+  function handle_command_start($matches)
+  {
+    $this->css_classes=array();
+    if ($this->is_new_line) $this->new_block_level=0;
+    $cmd = array_shift($matches);
+    switch($cmd)
+    {
+      case ' ':
+        $this->yybegin(self::INDENT_COMMAND);
+        return true;
+        break;
+      case '.': 
+        $this->indent();
+        $this->yybegin(self::CLASS_COMMAND);
+        break;
+      case '%':
+        $this->indent();
+        $this->yybegin(self::TAG_COMMAND);
+        break;
+      case '-':
+        $this->indent(true);
+        $this->yybegin(self::PHP_COMMAND);
+        break;
+      case '=':
+        $this->indent();
+        $this->yybegin(self::PHP_COMMAND_ECHO_BEGIN);
+        break;
+      case '+':
+        $this->indent();
+        $this->php_wrap = true;
+        $this->yybegin(self::PHP_COMMAND_ECHO_BEGIN);
+        break;
+      case '#':
+        $this->indent();
+        $this->yybegin(self::ID_COMMAND);
+        break;
+      case ':':
+        $this->indent();
+        $this->yybegin(self::ESCAPE_COMMAND);
+        break;
+      case '!':
+        $this->indent();
+        $this->yybegin(self::DOCTYPE_COMMAND);
+        return true;
+        break;
+      case "\t":
+        click_error("HAML error: You have a TAB where you shouldn't ({$this->new_block_level}). Check for tabs masquerading as invisible spaces. On line {$this->line} around " . trim(substr($this->data, $this->counter, 20)), $this->data);
+      default:
+        $this->indent();
+        $this->yybegin(self::TEXT_LINE);
+        return true;
+    }
+  }
+  
+  function handle_tag($matches)
+  {
+     $tag = array_shift($matches);
+     $this->current_tag = $tag;
+     echo "<$tag";
+     $this->is_current_tag_open=true;
+     $this->yybegin(self::COMMAND_CONTENT);
+  }
+  
+  
+  function handle_command_content_token($matches)
+  {
+    $short_tags = array('br', 'hr', 'link', 'meta', 'img', 'input');
+    $content = array_shift($matches);
+    switch($content)
+    {
+      case '{':
+        if (count($this->css_classes)>0)
+        {
+          echo ' class="' . join(' ', $this->css_classes) . '"';
+          $this->css_classes=array();
+        }
+        $this->yybegin(self::ATTRIBUTE_START);
+        break;
+      case '-':
+      case '=':
+      case '+':
+        if (count($this->css_classes)>0)
+        {
+          echo ' class="' . join(' ', $this->css_classes) . '"';
+          $this->css_classes=array();
+        }
+        $this->php_wrap = ($content == '+');
+        switch($content)
+        {
+          case '=':
+          case '+':
+            $this->yybegin(self::PHP_COMMAND_ECHO_BEGIN);
+            break;
+          case '-':
+            $this->yybegin(self::PHP_COMMAND);
+            break;
+        }
+        if ($this->current_tag && array_search($this->current_tag, $this->short_tags) !== false)
+        {
+          echo '/';
+          $this->current_tag = null;
+        }
+        echo ">";
+        $this->is_current_tag_open=false;
+        break;
+      case '%':
+        if (count($this->css_classes)>0)
+        {
+          echo ' class="' . join(' ', $this->css_classes) . '"';
+          $this->css_classes=array();
+        }
+        if ($this->current_tag && array_search($this->current_tag, $this->short_tags) !== false)
+        {
+          echo '/';
+          $this->current_tag = null;
+        }
+        echo ">";
+        $this->tag_stack[] = "</$this->current_tag>";
+        $this->current_block_level++;
+        $this->is_current_tag_open=false;
+        $this->yybegin(self::TAG_COMMAND);
+        break;
+      case "\n":
+        if (count($this->css_classes)>0)
+        {
+          echo ' class="' . join(' ', $this->css_classes) . '"';
+          $this->css_classes=array();
+        }
+        if ($this->current_tag && array_search($this->current_tag, $this->short_tags) !== false)
+        {
+          echo '/';
+          $this->current_tag = null;
+        }
+        echo ">";
+        $this->is_current_tag_open=false;
+        $this->is_new_line=true;
+        $this->yybegin(self::COMMAND_START);
+        break;
+      case '.':
+        $this->yybegin(self::CLASS_COMMAND);
+        break;
+      case '#':
+        $this->yybegin(self::ID_COMMAND);
+        break;
+      case ' ':
+        break;
+      default:
+        if (count($this->css_classes)>0)
+        {
+          echo ' class="' . join(' ', $this->css_classes) . '"';
+          $this->css_classes=array();
+        }
+        if ($this->current_tag && array_search($this->current_tag, $this->short_tags) !== false)
+        {
+          echo '/';
+          $this->current_tag = null;
+        }
+        echo ">";
+        $this->is_current_tag_open=false;
+        $this->yybegin(self::TEXT_LINE);
+        return true;
+        break;
+    }
+  }
+  
+  function handle_attribute_assign($matches)
+  {
+    $name = array_shift($matches);
+    echo " $name=\"<?= htmlentities(";
+    $this->yybegin(self::ATTRIBUTE_VALUE_TOKEN);
+    $this->attribute_value_expecting = array('php');
+  }
+  
+  function handle_attribute_value_token($matches)
+  {
+    $expecting = $this->attribute_value_expecting[count($this->attribute_value_expecting)-1];
+    $tok = array_shift($matches);
+    
+#    echo "\n|$tok| - expecting $expecting - stack " . join(", ", $this->attribute_value_expecting) ."\n";
+    
+    switch($expecting)
+    {
+      case 'php':
+        switch($tok)
+        {
+          case '(':
+            echo $tok;
+            $this->attribute_value_expecting[] = "nested_php";
+            break;
+          case '\'':
+            echo $tok;
+            $this->attribute_value_expecting[] = "squoted_text";
+            break;
+          case '"':
+            echo $tok;
+            $this->attribute_value_expecting[] = "dquoted_text";
+            break;
+          case '}':
+            array_pop($this->attribute_value_expecting);
+            echo ") ?>\"";
+            $this->yybegin(self::COMMAND_CONTENT);
+            break;
+          case ',':
+            array_pop($this->attribute_value_expecting);
+            echo ") ?>\"";
+            $this->yybegin(self::ATTRIBUTE_START);
+            break;
+            
+          default:
+            echo $tok;
+        }
+        break;
+      case 'nested_php':
+        echo $tok;
+        switch($tok)
+        {
+          case '(':
+            $this->attribute_value_expecting[] = "nested_php";
+            break;
+          case ')':
+            array_pop($this->attribute_value_expecting);
+            break;
+          case '\'':
+            $this->attribute_value_expecting[] = "squoted_text";
+            break;
+          case '"':
+            $this->attribute_value_expecting[] = "dquoted_text";
+            break;
+        }
+        break;
+      case 'dquoted_text':
+        echo $tok;
+        switch($tok)
+        {
+          case '$':
+            $this->attribute_value_expecting[] = "possible_php_escape";
+            break;
+          case '{':
+            $this->attribute_value_expecting[] = "escaped_php";
+            break;
+          case '"':
+            array_pop($this->attribute_value_expecting);
+            break;
+            
+        }
+        break;
+      case 'squoted_text':
+        echo $tok;
+        switch($tok)
+        {
+          case '\'':
+            array_pop($this->attribute_value_expecting);
+            break;
+          case '\\':
+            $this->attribute_value_expecting[] = "escaped_text_char";
+            break;
+        }
+        break;
+      case 'escaped_text_char':
+        echo $tok;
+        array_pop($this->attribute_value_expecting);
+        break;
+      case 'possible_php_escape':
+        echo $tok;
+        array_pop($this->attribute_value_expecting);
+        switch($tok)
+        {
+          case '{':
+            $this->attribute_value_expecting[] = "escaped_php";
+            break;
+        }
+        break;
+      case 'escaped_php':
+        echo $tok;
+        switch($tok)
+        {
+          case '(':
+            $this->attribute_value_expecting[] = "nested_php";
+          case '\'':
+            $this->attribute_value_expecting[] = "squoted_text";
+            break;
+          case '"':
+            $this->attribute_value_expecting[] = "dquoted_text";
+            break;
+          case '}':
+            array_pop($this->attribute_value_expecting);
+            break;
+        }
+        break;
+    }
+  }
+  
+  function handle_text_line($matches, $is_new_line=false, $is_last_line=false)
+  {
+    $line = array_shift($matches);
+    if ($is_new_line) $this->indent();
+    echo $line;
+    $this->is_new_line=true;
+    $this->yybegin(self::COMMAND_START);
+  }
+  
+  function handle_indent_run($matches)
+  {
+    $indent = array_shift($matches);
+    $this->new_block_level = strlen($indent)/2;
+    if ($this->new_block_level > count($this->tag_stack)+1) click_error("HAML error: You have indentation where you shouldn't ({$this->new_block_level}). Check for blank lines with indentation. On line {$this->line} around " . trim(substr($this->data, $this->counter, 20)), $this->data);
+    $this->is_new_line=false;
+    $this->yybegin(self::COMMAND_START);
+  }
+  
+
+  function handle_class_command($matches)
+  {
+    $this->css_classes[] = array_shift($matches);
+    if ($this->current_tag==null)
+    {
+      echo "<div";
+      $this->current_tag="div";
+    }
+    $this->yybegin(self::COMMAND_CONTENT);
+  }
+  
+  function handle_escape_command($matches)
+  {
+    $tok = array_shift($matches);
+    switch($tok)
+    {
+      case 'js':
+        echo "<script type='text/javascript'>\n//<![CDATA[";
+        $this->tag_stack[] = "//]]>\n</script>";
+        break;
+      case 'css':
+        echo '<style type="text/css">';
+        $this->tag_stack[] = '</style>';
+        break;
+      case 'sass':
+        $this->is_sass_mode = true;
+        $this->sass_lines = array();
+        echo '<style type="text/css">';
+        $this->tag_stack[] = '</style>';
+        break;
+      case 'php':
+        echo '<?';
+        $this->tag_stack[] = "?>";
+        break;
+      default:
+        click_error("Unsupported escape command: $tok -> {$this->data}");
+    }
+    $this->is_new_line=false;
+    $this->yybegin(self::ESCAPED_LINE);
+  }
+  
+  function output_sass()
+  {
+    $sass = join($this->sass_lines, "\n");
+    $md5 = md5($sass);
+    $fname = HAML_CACHE_FPATH."/$md5.sass";
+    file_put_contents($fname, $sass);
+    $renderer = SassRenderer::EXPANDED;
+    $parser = new SassParser(dirname($fname), SASS_CACHE_FPATH , $renderer);
+    $css = $parser->fetch($fname, $renderer);
+    $lines = split("\n",$css);
+    echo "\n";
+    foreach($lines as $line)
+    {
+      $indent = str_pad("", count($this->tag_stack)*2);
+      echo $indent.$line."\n";    
+    }
+  }
+  
+  function handle_escaped_line($matches)
+  {
+    $indent = array_shift($matches);
+    $line = array_shift($matches);
+    if ($this->is_new_line)
+    {
+      $current_block_level = count($this->tag_stack);
+      $this->new_block_level = strlen($indent)/2;
+      if ($this->new_block_level < $current_block_level)
+      {
+        if ($this->is_sass_mode)
+        {
+          $this->output_sass();
+        }
+        $this->is_sass_mode=false;
+        echo $indent;
+        echo array_pop($this->tag_stack);
+        $this->yybegin(self::COMMAND_START);
+        return true;
+      }
+    }
+    $out = $indent.$line;
+    if (!$this->is_sass_mode)
+    {
+      echo $out."\n";
+    } else {
+      if ($this->is_new_line) $this->sass_lines[] = substr($out,count($this->tag_stack)*2);
+    }
+    $this->is_new_line=true;
+    $this->yybegin(self::ESCAPED_LINE);
+  }
+  
+  function handle_id_command($matches)
+  {
+    $tok = array_shift($matches);
+    if ($this->current_tag==null)
+    {
+      echo "<div";
+      $this->current_tag="div";
+    }
+    echo " id=\"$tok\"";
+    $this->yybegin(self::COMMAND_CONTENT);
+  }
+  
+  
+  function handle_php_line($matches, $use_echo=false)
+  {
+    $php = array_shift($matches);
+    if (!$this->php_open)
+    {
+      if ($use_echo)
+      {
+        echo "<?= ";
+        if ($this->php_wrap) echo "htmlentities(";
+      } else {
+        echo "<? ";
+      }
+    }
+    echo $php;
+    if ($use_echo)
+    {
+      if ($this->php_wrap) echo ")";
+      echo " ?>";
+      $this->is_new_line=true;
+    } else {
+      $this->php_open = true;
+    }
+    $this->is_new_line=true;
+    $this->php_wrap = false;
+    $this->yybegin(self::COMMAND_START);
+  }
+  
+  function handle_doctype($matches)
+  {
+    $type=trim(array_shift($matches));
+    if (!$type) $type='1.1';
+    $types = array
+  	(
+  		'1.1' => '<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.1//EN" "http://www.w3.org/TR/xhtml11/DTD/xhtml11.dtd">',
+  		'Strict' => '<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd">',
+  		'Transitional' => '<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">',
+  		'Frameset' => '<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Frameset//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-frameset.dtd">',
+  		'XML' => "<?php echo '<?xml version=\"1.0\" encoding=\"utf-8\" ?>'; ?>\n"
+  	);
+  	echo $types[$type];
+  	$this->yybegin(self::COMMAND_START);
+  }
+  
+function strToHex($string)
+{
+    $hex='';
+    for ($i=0; $i < strlen($string); $i++)
+    {
+        $hex .= dechex(ord($string[$i])) . " ";
+    }
+    return $hex;
+}
+  
+/*!lex2php
+%input $this->data
+%counter $this->counter
+%token $this->token
+%value $this->value
+%line $this->line
+command_start = /(.)/
+tag = /([\w\-_]+) */
+content_token = /(.|\n)/
+whitespace = / */
+attribute_name = /:(\w+)/
+attribute_assign = /=>/
+indent_run = /( +)/
+php_line = /(.*?)\n/
+final_php_line = /(.*)/
+text_line = / *(.*?)\n/
+final_text_line = / *(.*)/
+escaped_line = /( *)(.*?)\n/
+final_escaped_line = /( *)(.*)/
+doctype = /!!!(.*?)\n/
+blank_line = /(.*)\n/
+*/
+/*!lex2php
+%statename COMMAND_START
+command_start {
+  return $this->handle_command_start($yy_subpatterns);
+}
+blank_line {
+  echo "\n";
+}
+*/
+/*!lex2php
+%statename TAG_COMMAND
+tag {
+  return $this->handle_tag($yy_subpatterns);
+}
+*/
+/*!lex2php
+%statename COMMAND_CONTENT
+content_token {
+  return $this->handle_command_content_token($yy_subpatterns);
+}
+*/
+/*!lex2php
+%statename ATTRIBUTE_START
+whitespace attribute_name whitespace attribute_assign whitespace {
+  return $this->handle_attribute_assign($yy_subpatterns);
+}
+*/
+/*!lex2php
+%statename ATTRIBUTE_VALUE_TOKEN
+content_token {
+  return $this->handle_attribute_value_token($yy_subpatterns);
+}
+*/
+/*!lex2php
+%statename TEXT_LINE
+text_line {
+  return $this->handle_text_line($yy_subpatterns);
+}
+final_text_line {
+  return $this->handle_text_line($yy_subpatterns);
+}
+*/
+/*!lex2php
+%statename INDENT_COMMAND
+indent_run {
+  return $this->handle_indent_run($yy_subpatterns);
+}
+*/
+/*!lex2php
+%statename PHP_COMMAND_ECHO_BEGIN
+whitespace php_line {
+  return $this->handle_php_line($yy_subpatterns,true);
+}
+whitespace final_php_line {
+  return $this->handle_php_line($yy_subpatterns,true);
+}
+*/
+/*!lex2php
+%statename CLASS_COMMAND
+tag {
+  return $this->handle_class_command($yy_subpatterns);
+}
+*/
+/*!lex2php
+%statename ESCAPE_COMMAND
+tag {
+  return $this->handle_escape_command($yy_subpatterns);
+}
+*/
+/*!lex2php
+%statename ESCAPED_LINE
+escaped_line {
+  return $this->handle_escaped_line($yy_subpatterns);
+}
+final_escaped_line {
+  return $this->handle_escaped_line($yy_subpatterns);
+}
+*/
+
+/*!lex2php
+%statename ID_COMMAND
+tag {
+  return $this->handle_id_command($yy_subpatterns);
+}
+*/
+/*!lex2php
+%statename PHP_COMMAND
+whitespace php_line {
+  return $this->handle_php_line($yy_subpatterns);
+}
+whitespace final_php_line {
+  return $this->handle_php_line($yy_subpatterns);
+}
+*/
+/*!lex2php
+%statename DOCTYPE_COMMAND
+doctype {
+  return $this->handle_doctype($yy_subpatterns);
+}
+text_line
+ {
+  return $this->handle_text_line($yy_subpatterns,true);
+}
+
+*/
+
+}
+?>

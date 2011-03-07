@@ -1,0 +1,14 @@
+%table
+  %tr
+    %th
+    %th Date
+    %th From
+    %th Subject
+    %th
+  -foreach($current_user->private_messages as $message)
+    %tr
+      %td =(!$message->read_at) ? 'new' : ''
+      %td =click_date_format($message->created_at)
+      %td +$message->sender->profile->screen_name
+      %td +$message->subject
+      %td %a{:href=>view_private_message_url($message)} view

@@ -1,0 +1,6 @@
+%h2 Cachegrind Links
+- if (count($links)>0)
+  %ul
+    - foreach($links as $link)
+      %li
+        %a{:href=>$link['href']}= $link['label']

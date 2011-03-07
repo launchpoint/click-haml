@@ -1,0 +1,7 @@
+
+<?
+  dprint("hello, world!")
+  {
+  }
+
+?>
